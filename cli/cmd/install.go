@@ -10,10 +10,9 @@ import (
 	"path"
 	"time"
 
-	"github.com/golang/protobuf/jsonpb"
+	"github.com/gogo/protobuf/jsonpb"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/linkerd/linkerd2/cli/static"
-	"github.com/linkerd/linkerd2/controller/gen/config"
 	pb "github.com/linkerd/linkerd2/controller/gen/config"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/tls"
@@ -56,7 +55,7 @@ type (
 		EnableH2Upgrade          bool
 		NoInitContainer          bool
 
-		Configs configValues
+		Configs configJSONs
 
 		DestinationResources,
 		GrafanaResources,
@@ -70,7 +69,7 @@ type (
 		Identity *installIdentityValues
 	}
 
-	configValues struct{ Global, Proxy, Install string }
+	configJSONs struct{ Global, Proxy, Install string }
 
 	resources   struct{ CPU, Memory constraints }
 	constraints struct{ Request, Limit string }
@@ -111,6 +110,9 @@ type (
 		*proxyConfigOptions
 
 		recordedFlags []*pb.Install_Flag
+
+		// For upgrade and tests.
+		overrideIdentity *installIdentityValues
 
 		overrideUUIDForTest string
 	}
@@ -203,8 +205,19 @@ func newCmdInstall() *cobra.Command {
 		Short: "Output Kubernetes configs to install Linkerd",
 		Long:  "Output Kubernetes configs to install Linkerd.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			options.recordFlags(flags)
+			if !options.ignoreCluster {
+				exists, err := linkerdConfigAlreadyExistsInCluster()
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "Unable to connect to a Kubernetes cluster to check for configuration. If this expected, use the --ignore-cluster flag.")
+					os.Exit(1)
+				}
+				if exists {
+					fmt.Fprintln(os.Stderr, "You are already running a control plane. If you would like to ignore its configuration, use the --ignore-cluster flag.")
+					os.Exit(1)
+				}
+			}
 
+			options.recordFlags(flags)
 			values, configs, err := options.validateAndBuild()
 			if err != nil {
 				return err
@@ -302,18 +315,6 @@ func (options *installOptions) validate() error {
 		return errors.New("--proxy-log-level must not be empty")
 	}
 
-	if !options.ignoreCluster {
-		exists, err := linkerdConfigAlreadyExistsInCluster()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Unable to connect to a Kubernetes cluster to check for configuration. If this expected, use the --ignore-cluster flag.")
-			os.Exit(1)
-		}
-		if exists {
-			fmt.Fprintln(os.Stderr, "You are already running a control plane. If you would like to ignore its configuration, use the --ignore-cluster flag.")
-			os.Exit(1)
-		}
-	}
-
 	return nil
 }
 
@@ -385,7 +386,7 @@ func (options *installOptions) validateAndBuild() (*installValues, *pb.All, erro
 		ProxyAutoInjectEnabled: options.proxyAutoInject,
 		PrometheusLogLevel:     toPromLogLevel(options.controllerLogLevel),
 
-		Configs: configValues{
+		Configs: configJSONs{
 			Global:  globalJSON,
 			Proxy:   proxyJSON,
 			Install: installJSON,
@@ -495,7 +496,7 @@ func (values *installValues) render(w io.Writer, configs *pb.All) error {
 	// Skip outbound port 443 to enable Kubernetes API access without the proxy.
 	// Once Kubernetes supports sidecar containers, this may be removed, as that
 	// will guarantee the proxy is running prior to control-plane startup.
-	configs.Proxy.IgnoreOutboundPorts = append(configs.Proxy.IgnoreOutboundPorts, &config.Port{Port: 443})
+	configs.Proxy.IgnoreOutboundPorts = append(configs.Proxy.IgnoreOutboundPorts, &pb.Port{Port: 443})
 
 	return processYAML(&buf, w, ioutil.Discard, resourceTransformerInject{
 		configs: configs,
@@ -582,7 +583,7 @@ func (options *installOptions) proxyConfig() *pb.Proxy {
 		InboundPort: &pb.Port{
 			Port: uint32(options.proxyInboundPort),
 		},
-		AdminPort: &config.Port{
+		AdminPort: &pb.Port{
 			Port: uint32(options.proxyAdminPort),
 		},
 		OutboundPort: &pb.Port{
