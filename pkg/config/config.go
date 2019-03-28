@@ -73,6 +73,6 @@ func ToJSON(configs *pb.All) (global, proxy, install string, err error) {
 		return
 	}
 
-	install, err = m.MarshalToString(configs.GetProxy())
+	install, err = m.MarshalToString(configs.GetInstall())
 	return
 }
