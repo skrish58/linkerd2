@@ -52,6 +52,10 @@ func newCmdUpgrade() *cobra.Command {
 			// flag on this upgrade, reset that prior value as if it were specified now.
 			setOptionsFromInstall(flags, configs.GetInstall())
 
+			if err = options.validate(); err != nil {
+				return err
+			}
+
 			// Save off the updated set of flags into the installOptions so it gets
 			// persisted with the upgraded config.
 			options.recordFlags(flags)
@@ -59,10 +63,18 @@ func newCmdUpgrade() *cobra.Command {
 			// Update the configs from the synthesized options.
 			options.overrideConfigs(configs, map[string]string{})
 
-			values, configs, err := options.build(k, configs)
+			values, err := options.buildValuesWithoutIdentity(configs)
 			if err != nil {
 				return fmt.Errorf("could not build install configuration: %s", err)
 			}
+
+			identityValues, err := fetchIdentityValues(k, options.controllerReplicas, configs.GetGlobal().GetIdentityContext())
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "Unable to fetch the existing issuer credentials from Kubernetes.")
+				fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+				os.Exit(1)
+			}
+			values.Identity = identityValues
 
 			if err = values.render(os.Stdout, configs); err != nil {
 				return fmt.Errorf("could not render install configuration: %s", err)
@@ -78,99 +90,12 @@ func newCmdUpgrade() *cobra.Command {
 
 func setOptionsFromInstall(flags *pflag.FlagSet, install *pb.Install) {
 	for _, i := range install.GetFlags() {
+		fmt.Printf("flags: setting: %s %s\n", i.GetName(), i.GetValue())
 		if f := flags.Lookup(i.GetName()); f != nil && !f.Changed {
 			f.Value.Set(i.GetValue())
+			fmt.Printf("flags: set: %s %s\n", f.Name, f.Value)
 		}
 	}
-}
-
-// fetchInstallValuesFromCluster checks the kubernetes API to fetch an existing
-// linkerd configuration.
-//
-// This bypasses the public API so that we can access secrets and validate permissions.
-func (options *upgradeOptions) build(k *kubernetes.Clientset, configs *pb.All) (*installValues, *pb.All, error) {
-	upgradeFlags := make(map[string]string)
-	for _, f := range options.recordedFlags {
-		upgradeFlags[f.Name] = f.Value
-	}
-
-	for _, f := range configs.GetInstall().GetFlags() {
-		if _, exist := upgradeFlags[f.Name]; !exist {
-			panic("todo")
-		}
-	}
-
-	// Override the configs from the command-line flags.
-	options.overrideConfigs(configs, make(map[string]string))
-
-	values := &installValues{
-		// Container images:
-		ControllerImage: fmt.Sprintf("%s/controller:%s", options.dockerRegistry, configs.GetGlobal().GetVersion()),
-		WebImage:        fmt.Sprintf("%s/web:%s", options.dockerRegistry, configs.GetGlobal().GetVersion()),
-		GrafanaImage:    fmt.Sprintf("%s/grafana:%s", options.dockerRegistry, configs.GetGlobal().GetVersion()),
-		PrometheusImage: prometheusImage,
-		ImagePullPolicy: configs.Proxy.ProxyImage.PullPolicy,
-
-		// Kubernetes labels/annotations/resourcse:
-		CreatedByAnnotation:      k8s.CreatedByAnnotation,
-		CliVersion:               k8s.CreatedByAnnotationValue(),
-		ControllerComponentLabel: k8s.ControllerComponentLabel,
-		ProxyContainerName:       k8s.ProxyContainerName,
-		ProxyInjectAnnotation:    k8s.ProxyInjectAnnotation,
-		ProxyInjectDisabled:      k8s.ProxyInjectDisabled,
-
-		// Controller configuration:
-		Namespace:              controlPlaneNamespace,
-		UUID:                   configs.GetInstall().GetUuid(),
-		ControllerLogLevel:     options.controllerLogLevel,
-		PrometheusLogLevel:     toPromLogLevel(options.controllerLogLevel),
-		ControllerReplicas:     1,
-		ControllerUID:          options.controllerUID,
-		EnableH2Upgrade:        !options.disableH2Upgrade,
-		NoInitContainer:        configs.GetGlobal().GetCniEnabled(),
-		ProxyAutoInjectEnabled: configs.GetGlobal().GetAutoInjectContext() != nil,
-	}
-
-	g, p, i, err := config.ToJSON(configs)
-	if err != nil {
-		return nil, nil, err
-	}
-	values.Configs = configJSONs{Global: g, Proxy: p, Install: i}
-
-	idctx := configs.GetGlobal().GetIdentityContext()
-	if idctx == nil {
-		// If we're upgrading from a version without identity, generate a new one.
-		i, err := newInstallIdentityOptionsWithDefaults().genValues()
-		if err != nil {
-			return nil, nil, err
-		}
-
-		values.Identity = i
-		return values, configs, nil
-	}
-
-	keyPEM, crtPEM, expiry, err := fetchIssuer(k, idctx.GetTrustAnchorsPem())
-	if err != nil {
-		return nil, nil, err
-	}
-
-	identityReplicas := uint(1)
-	values.Identity = &installIdentityValues{
-		Replicas:        identityReplicas,
-		TrustDomain:     idctx.GetTrustDomain(),
-		TrustAnchorsPEM: idctx.GetTrustAnchorsPem(),
-		Issuer: &issuerValues{
-			ClockSkewAllowance:  idctx.GetClockSkewAllowance().String(),
-			IssuanceLifetime:    idctx.GetIssuanceLifetime().String(),
-			CrtExpiryAnnotation: k8s.IdentityIssuerExpiryAnnotation,
-
-			KeyPEM:    keyPEM,
-			CrtPEM:    crtPEM,
-			CrtExpiry: expiry,
-		},
-	}
-
-	return values, configs, nil
 }
 
 func (options *upgradeOptions) newK8s() (*kubernetes.Clientset, error) {
@@ -186,8 +111,12 @@ func (options *upgradeOptions) newK8s() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(api.Config)
 }
 
+// fetchIdentityValue checks the kubernetes API to fetch an existing
+// linkerd configuration.
+//
+// This bypasses the public API so that upgrades can proceed when the API pod is
+// not available.
 func fetchConfigs(k *kubernetes.Clientset) (*pb.All, error) {
-
 	configMap, err := k.CoreV1().
 		ConfigMaps(controlPlaneNamespace).
 		Get(k8s.ConfigConfigMapName, metav1.GetOptions{})
@@ -196,6 +125,37 @@ func fetchConfigs(k *kubernetes.Clientset) (*pb.All, error) {
 	}
 
 	return config.FromConfigMap(configMap.Data)
+}
+
+// fetchIdentityValue checks the kubernetes API to fetch an existing
+// linkerd identity configuration.
+//
+// This bypasses the public API so that we can access secrets and validate
+// permissions.
+func fetchIdentityValues(k *kubernetes.Clientset, replicas uint, idctx *pb.IdentityContext) (*installIdentityValues, error) {
+	if idctx == nil {
+		return nil, nil
+	}
+
+	keyPEM, crtPEM, expiry, err := fetchIssuer(k, idctx.GetTrustAnchorsPem())
+	if err != nil {
+		return nil, err
+	}
+
+	return &installIdentityValues{
+		Replicas:        replicas,
+		TrustDomain:     idctx.GetTrustDomain(),
+		TrustAnchorsPEM: idctx.GetTrustAnchorsPem(),
+		Issuer: &issuerValues{
+			ClockSkewAllowance:  idctx.GetClockSkewAllowance().String(),
+			IssuanceLifetime:    idctx.GetIssuanceLifetime().String(),
+			CrtExpiryAnnotation: k8s.IdentityIssuerExpiryAnnotation,
+
+			KeyPEM:    keyPEM,
+			CrtPEM:    crtPEM,
+			CrtExpiry: expiry,
+		},
+	}, nil
 }
 
 func fetchIssuer(k *kubernetes.Clientset, trustPEM string) (string, string, time.Time, error) {

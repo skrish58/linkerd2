@@ -10,10 +10,10 @@ import (
 	"path"
 	"time"
 
-	"github.com/gogo/protobuf/jsonpb"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/linkerd/linkerd2/cli/static"
 	pb "github.com/linkerd/linkerd2/controller/gen/config"
+	"github.com/linkerd/linkerd2/pkg/config"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	"github.com/linkerd/linkerd2/pkg/tls"
 	"github.com/linkerd/linkerd2/pkg/version"
@@ -111,9 +111,6 @@ type (
 
 		recordedFlags []*pb.Install_Flag
 
-		// For upgrade and tests.
-		overrideIdentity *installIdentityValues
-
 		overrideUUIDForTest string
 	}
 
@@ -200,34 +197,49 @@ func newInstallIdentityOptionsWithDefaults() *installIdentityOptions {
 func newCmdInstall() *cobra.Command {
 	options := newInstallOptionsWithDefaults()
 	flags := options.flagSet(pflag.ExitOnError)
+
 	cmd := &cobra.Command{
 		Use:   "install [flags]",
 		Short: "Output Kubernetes configs to install Linkerd",
 		Long:  "Output Kubernetes configs to install Linkerd.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !options.ignoreCluster {
-				exists, err := linkerdConfigAlreadyExistsInCluster()
-				if err != nil {
-					fmt.Fprintln(os.Stderr, "Unable to connect to a Kubernetes cluster to check for configuration. If this expected, use the --ignore-cluster flag.")
-					os.Exit(1)
-				}
-				if exists {
-					fmt.Fprintln(os.Stderr, "You are already running a control plane. If you would like to ignore its configuration, use the --ignore-cluster flag.")
-					os.Exit(1)
-				}
+				exitIfClusterExists()
 			}
 
-			options.recordFlags(flags)
-			values, configs, err := options.validateAndBuild()
+			values, configs, err := options.validateAndBuild(flags)
 			if err != nil {
 				return err
 			}
+
 			return values.render(os.Stdout, configs)
 		},
 	}
 
 	cmd.PersistentFlags().AddFlagSet(flags)
 	return cmd
+}
+
+func (options *installOptions) validateAndBuild(flags *pflag.FlagSet) (*installValues, *pb.All, error) {
+	if err := options.validate(); err != nil {
+		return nil, nil, err
+	}
+
+	identityValues, err := options.identityOptions.validateAndBuild()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	options.recordFlags(flags)
+	configs := options.configs(identityValues.toIdentityContext())
+
+	values, err := options.buildValuesWithoutIdentity(configs)
+	if err != nil {
+		return nil, nil, err
+	}
+	values.Identity = identityValues
+
+	return values, configs, nil
 }
 
 func (options *installOptions) flagSet(e pflag.ErrorHandling) *pflag.FlagSet {
@@ -288,12 +300,21 @@ func (options *installOptions) flagSet(e pflag.ErrorHandling) *pflag.FlagSet {
 }
 
 func (options *installOptions) recordFlags(flags *pflag.FlagSet) {
+	if flags == nil {
+		return
+	}
+
 	flags.VisitAll(func(f *pflag.Flag) {
-		if f.Changed && f.Name != "ignore-cluster" {
-			options.recordedFlags = append(options.recordedFlags, &pb.Install_Flag{
-				Name:  f.Name,
-				Value: f.Value.String(),
-			})
+		if f.Changed {
+			switch f.Name {
+			case "ignore-cluster", "linkerd-version":
+				// Thse flags don't make sense to record.
+			default:
+				options.recordedFlags = append(options.recordedFlags, &pb.Install_Flag{
+					Name:  f.Name,
+					Value: f.Value.String(),
+				})
+			}
 		}
 	})
 }
@@ -315,14 +336,6 @@ func (options *installOptions) validate() error {
 		return errors.New("--proxy-log-level must not be empty")
 	}
 
-	return nil
-}
-
-func (options *installOptions) validateAndBuild() (*installValues, *pb.All, error) {
-	if err := options.validate(); err != nil {
-		return nil, nil, err
-	}
-
 	if options.highAvailability {
 		if options.controllerReplicas == defaultControllerReplicas {
 			options.controllerReplicas = defaultHAControllerReplicas
@@ -338,25 +351,14 @@ func (options *installOptions) validateAndBuild() (*installValues, *pb.All, erro
 	}
 
 	options.identityOptions.replicas = options.controllerReplicas
-	identityValues, err := options.identityOptions.validateAndBuild()
-	if err != nil {
-		return nil, nil, err
-	}
 
-	configs := options.configs(identityValues.toIdentityContext())
+	return nil
+}
 
-	j := jsonpb.Marshaler{EmitDefaults: true}
-	globalJSON, err := j.MarshalToString(configs.GetGlobal())
+func (options *installOptions) buildValuesWithoutIdentity(configs *pb.All) (*installValues, error) {
+	globalJSON, proxyJSON, installJSON, err := config.ToJSON(configs)
 	if err != nil {
-		return nil, nil, err
-	}
-	proxyJSON, err := j.MarshalToString(configs.GetProxy())
-	if err != nil {
-		return nil, nil, err
-	}
-	installJSON, err := j.MarshalToString(configs.GetInstall())
-	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	values := &installValues{
@@ -391,8 +393,6 @@ func (options *installOptions) validateAndBuild() (*installValues, *pb.All, erro
 			Proxy:   proxyJSON,
 			Install: installJSON,
 		},
-
-		Identity: identityValues,
 	}
 
 	if options.highAvailability {
@@ -419,7 +419,7 @@ func (options *installOptions) validateAndBuild() (*installValues, *pb.All, erro
 		}
 	}
 
-	return values, configs, nil
+	return values, nil
 }
 
 func toPromLogLevel(level string) string {
@@ -603,34 +603,40 @@ func (options *installOptions) proxyConfig() *pb.Proxy {
 	}
 }
 
-// linkerdConfigAlreadyExistsInCluster checks the kubernetes API to determine
-// whether a config exists.
+// exitIfClusterExists checks the kubernetes API to determine
+// whether a config exists and exits if it does exist or if an error is
+// encountered.
 //
 // This bypasses the public API so that public API errors cannot cause us to
 // misdiagnose a controller error to indicate that no control plane exists.
-//
-// If we cannot determine whether the configuration exists, an error is returned.
-func linkerdConfigAlreadyExistsInCluster() (bool, error) {
+func exitIfClusterExists() {
 	api, err := k8s.NewAPI(kubeconfigPath, kubeContext)
 	if err != nil {
-		return false, err
+		fmt.Fprintln(os.Stderr, "Unable to build a Kubernetes client to check for configuration. If this expected, use the --ignore-cluster flag.")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
 	}
 
 	k, err := kubernetes.NewForConfig(api.Config)
 	if err != nil {
-		return false, err
+		fmt.Fprintln(os.Stderr, "Unable to build a Kubernetes client to check for configuration. If this expected, use the --ignore-cluster flag.")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
 	}
 
 	c := k.CoreV1().ConfigMaps(controlPlaneNamespace)
 	if _, err = c.Get(k8s.ConfigConfigMapName, metav1.GetOptions{}); err != nil {
 		if kerrors.IsNotFound(err) {
-			return false, nil
+			return
 		}
 
-		return false, err
+		fmt.Fprintln(os.Stderr, "Unable to build a Kubernetes client to check for configuration. If this expected, use the --ignore-cluster flag.")
+		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		os.Exit(1)
 	}
 
-	return true, nil
+	fmt.Fprintln(os.Stderr, "You are already running a control plane. If you would like to ignore its configuration, use the --ignore-cluster flag.")
+	os.Exit(1)
 }
 
 func (idopts *installIdentityOptions) validate() error {
@@ -638,7 +644,7 @@ func (idopts *installIdentityOptions) validate() error {
 		return nil
 	}
 
-	if idopts.trustDomain == "" {
+	if idopts.trustDomain != "" {
 		if errs := validation.IsDNS1123Subdomain(idopts.trustDomain); len(errs) > 0 {
 			return fmt.Errorf("invalid trust domain '%s': %s", idopts.trustDomain, errs[0])
 		}
