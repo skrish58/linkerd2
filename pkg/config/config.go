@@ -13,18 +13,18 @@ import (
 // Global returns the Global protobuf config from the linkerd-config ConfigMap
 func Global(filepath string) (*pb.Global, error) {
 	config := &pb.Global{}
-	err := unmarshalConfig(filepath, config)
+	err := unmarshalFile(filepath, config)
 	return config, err
 }
 
 // Proxy returns the Proxy protobuf config from the linkerd-config ConfigMap
 func Proxy(filepath string) (*pb.Proxy, error) {
 	config := &pb.Proxy{}
-	err := unmarshalConfig(filepath, config)
+	err := unmarshalFile(filepath, config)
 	return config, err
 }
 
-func unmarshalConfig(filepath string, msg proto.Message) error {
+func unmarshalFile(filepath string, msg proto.Message) error {
 	configJSON, err := ioutil.ReadFile(filepath)
 	if err != nil {
 		return err
@@ -35,7 +35,7 @@ func unmarshalConfig(filepath string, msg proto.Message) error {
 }
 
 func unmarshal(json string, msg proto.Message) error {
-	u := jsonpb.Unmarshaler{}
+	u := jsonpb.Unmarshaler{AllowUnknownFields: true}
 	return u.Unmarshal(strings.NewReader(json), msg)
 }
 

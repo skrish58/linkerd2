@@ -36,7 +36,7 @@ func newCmdUpgrade() *cobra.Command {
 			// We need a Kubernetes client to fetch configs and issuer secrets.
 			k, err := options.newK8s()
 			if err != nil {
-				return err
+				return fmt.Errorf("failed to create a kubernetes client: %s", err)
 			}
 
 			// We fetch the configs directly from kubernetes because we need to be able
@@ -45,12 +45,12 @@ func newCmdUpgrade() *cobra.Command {
 			// control plane.
 			configs, err := fetchConfigs(k)
 			if err != nil {
-				return err
+				return fmt.Errorf("could not fetch configs from kubernetes: %s", err)
 			}
 
 			// We recorded flags during a prior install. If we haven't overridden the
 			// flag on this upgrade, reset that prior value as if it were specified now.
-			setOptionsFromConfigs(flags, configs)
+			setOptionsFromInstall(flags, configs.GetInstall())
 
 			// Save off the updated set of flags into the installOptions so it gets
 			// persisted with the upgraded config.
@@ -61,10 +61,14 @@ func newCmdUpgrade() *cobra.Command {
 
 			values, configs, err := options.build(k, configs)
 			if err != nil {
-				return err
+				return fmt.Errorf("could not build install configuration: %s", err)
 			}
 
-			return values.render(os.Stdout, configs)
+			if err = values.render(os.Stdout, configs); err != nil {
+				return fmt.Errorf("could not render install configuration: %s", err)
+			}
+
+			return nil
 		},
 	}
 
@@ -72,19 +76,12 @@ func newCmdUpgrade() *cobra.Command {
 	return cmd
 }
 
-func setOptionsFromConfigs(flags *pflag.FlagSet, configs *pb.All) {
-	priorFlags := map[string]string{}
-	for _, f := range configs.GetInstall().GetFlags() {
-		priorFlags[f.Name] = f.Value
-	}
-
-	flags.Visit(func(f *pflag.Flag) {
-		if !f.Changed {
-			if v, ok := priorFlags[f.Name]; ok {
-				f.Value.Set(v)
-			}
+func setOptionsFromInstall(flags *pflag.FlagSet, install *pb.Install) {
+	for _, i := range install.GetFlags() {
+		if f := flags.Lookup(i.GetName()); f != nil && !f.Changed {
+			f.Value.Set(i.GetValue())
 		}
-	})
+	}
 }
 
 // fetchInstallValuesFromCluster checks the kubernetes API to fetch an existing
