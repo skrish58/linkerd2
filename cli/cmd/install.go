@@ -217,6 +217,10 @@ func newCmdInstall() *cobra.Command {
 	}
 
 	cmd.PersistentFlags().AddFlagSet(flags)
+
+	// Issuer flags are currently only supported on the initial install.
+	cmd.PersistentFlags().AddFlagSet(options.issuerFlagSet(pflag.ExitOnError))
+
 	return cmd
 }
 
@@ -271,6 +275,17 @@ func (options *installOptions) flagSet(e pflag.ErrorHandling) *pflag.FlagSet {
 		&options.disableH2Upgrade, "disable-h2-upgrade", options.disableH2Upgrade,
 		"Prevents the controller from instructing proxies to perform transparent HTTP/2 upgrading (default false)",
 	)
+	flags.DurationVar(
+		&options.identityOptions.issuanceLifetime, "identity-issuance-lifetime", options.identityOptions.issuanceLifetime,
+		"The amount of time for which the Identity issuer should certify identity",
+	)
+
+	return flags
+}
+
+func (options *installOptions) issuerFlagSet(e pflag.ErrorHandling) *pflag.FlagSet {
+	flags := pflag.NewFlagSet("issuer", e)
+
 	flags.StringVar(
 		&options.identityOptions.trustDomain, "identity-trust-domain", options.identityOptions.trustDomain,
 		"Configures the name suffix used for identities.",
