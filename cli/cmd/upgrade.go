@@ -62,6 +62,7 @@ func newCmdUpgrade() *cobra.Command {
 
 			// Update the configs from the synthesized options.
 			options.overrideConfigs(configs, map[string]string{})
+			configs.GetInstall().Flags = options.recordedFlags
 
 			values, err := options.buildValuesWithoutIdentity(configs)
 			if err != nil {
@@ -93,7 +94,7 @@ func setOptionsFromInstall(flags *pflag.FlagSet, install *pb.Install) {
 		fmt.Printf("flags: setting: %s %s\n", i.GetName(), i.GetValue())
 		if f := flags.Lookup(i.GetName()); f != nil && !f.Changed {
 			f.Value.Set(i.GetValue())
-			fmt.Printf("flags: set: %s %s\n", f.Name, f.Value)
+			f.Changed = true
 		}
 	}
 }
